@@ -123,19 +123,27 @@ fn tls_build_finished_heap(verify_data: mut ref i64, out: mut ref i64) -> i64
 fn tls_certverify_signed_content_heap(transcript_hash: mut ref i64, out: mut ref i64) -> i64
 
 fn tls_hash_transcript_heap(transcript: mut ref i64, transcript_len: i64) -> [u8; 32]
-fn tls_derive_secret_heap(secret: mut ref i64, label: Str, transcript: mut ref i64, transcript_len: i64) -> [u8; 32]
-fn tls_finished_verify_data_heap(traffic_secret: mut ref i64, transcript: mut ref i64, transcript_len: i64) -> [u8; 32]
+fn tls_derive_secret_heap(secret: mut ref i64, label: Str, transcript: mut ref i64, transcript_len: i64, out: mut ref i64) -> i64
+fn tls_finished_verify_data_heap(traffic_secret: mut ref i64, transcript: mut ref i64, transcript_len: i64, out: mut ref i64) -> i64
+fn tls_derive_traffic_keys_heap(secret: mut ref i64, out_key: mut ref i64, out_iv: mut ref i64) -> i64
 
 fn tls_encrypt_record_heap(key: mut ref i64, static_iv: mut ref i64, seq: u32, content: mut ref i64, content_len: i64, content_type: u32, out_record: mut ref i64) -> i64
 fn tls_decrypt_record_heap(key: mut ref i64, static_iv: mut ref i64, seq: u32, rec_data: mut ref i64, record_len: i64, expected_content_type: u32, out_content: mut ref i64) -> i64
 ```
 
-`tls_hmac_sha256`/`tls_hkdf_extract`/`tls_hkdf_expand`/`tls_hkdf_
-expand_label`/`tls_derive_traffic_keys`/`tls_record_nonce`/`tls_
-basepoint32`/`tls_bytes_equal32` are reused as-is from the array API
-above for the heap-native functions too -- HMAC/HKDF/key-schedule
-operations always work on small, bounded 12-32-byte values (keys,
-IVs, digests) regardless of a board's own overall record-size ceiling.
+Every `_heap` function above (except `tls_hash_transcript_heap`,
+which reads more naturally as a return value like its array-API
+counterpart) writes its result into an `out`/`out_key`+`out_iv`
+parameter and returns an `i64` status — matching Pi 1's own original
+calling convention for these exact operations, and DhruvaOS's
+pre-existing `chacha20_poly1305_encrypt_heap`/`ed25519_secret_to_
+public_heap` adapters. `tls_hmac_sha256`/`tls_hkdf_extract`/`tls_
+hkdf_expand`/`tls_hkdf_expand_label`/`tls_derive_traffic_keys`/`tls_
+record_nonce`/`tls_basepoint32`/`tls_bytes_equal32` are reused as-is
+from the array API above for the heap-native functions too — HMAC/
+HKDF/key-schedule operations always work on small, bounded 12-32-byte
+values (keys, IVs, digests) regardless of a board's own overall
+record-size ceiling.
 
 ## Verification
 
