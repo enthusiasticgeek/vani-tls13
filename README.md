@@ -30,6 +30,18 @@ TCP-transport chunking of records into a byte stream, and any real
 network I/O. A consumer wires this package's pure functions into its
 own board-specific transport and session-state handling.
 
+## core.vani vs. lib.vani
+
+Like `crypto_hash`/`curve25519`/`chacha20_poly1305`, this package ships
+both: `src/lib.vani` is the full API plus `tls13_self_test()`, vendoring
+its dependencies' own `lib.vani` (which includes THEIR self-tests
+too). `src/core.vani` is the same API minus `tls13_self_test()`,
+vendoring `core.vani` copies of its dependencies instead — for a
+consumer whose own code already defines names colliding with
+`sha256_self_test`/`x25519_self_test`/`ed25519_self_test`/
+`chacha20_poly1305_self_test`/etc. (DhruvaOS's Pi 1 kernel is the
+motivating example). Pick whichever doesn't collide with your own code.
+
 ## Dependencies
 
 Vendored at `./vendor/<name>` and pulled in via direct relative `use`

@@ -1,0 +1,1050 @@
+// tls13 CORE v0.1.0 -- same API as src/lib.vani, minus tls13_self_test
+// and vendoring core.vani (not lib.vani) copies of its own
+// dependencies -- for a consumer whose own code already defines
+// names colliding with crypto_hash/curve25519/chacha20_poly1305's
+// own self-tests (sha256_self_test, x25519_self_test, etc.), matching
+// exactly why those packages ship the same core/lib split themselves.
+// DhruvaOS's Pi 1 kernel is the motivating consumer (round 174); see
+// this repo's own README for the full rationale.
+
+// tls13 v0.1.0 -- TLS 1.3 (TLS_CHACHA20_POLY1305_SHA256, X25519,
+// Ed25519, RFC 7250 raw public keys) handshake + record layer, pure
+// vani, hardware-agnostic and heap-free -- fixed-size array
+// parameters, no allocator, no extern "C" dependency.
+//
+// Extracted from DhruvaOS's Pi 4/5 port (round 166, 2026-09-10) --
+// itself a faithful port of DhruvaOS's Pi 1 kernel's own original TLS
+// 1.3 implementation (kernel_main.vani lines ~23772-25172) -- so both
+// boards, and any future one, can share this ONE implementation
+// instead of each keeping its own copy. Every wire-format constant,
+// HKDF label, and message-building byte sequence below is copied
+// directly from that original Pi 1 source, not re-derived.
+//
+// This is the pure protocol/crypto-orchestration layer only: record
+// layer, key schedule, handshake message builders. No scratch-buffer
+// /heap dependency at all -- everything threaded through function
+// parameters/returns as fixed-size local arrays, matching curve25519/
+// chacha20_poly1305's own array-based return-by-value convention.
+// The STATEFUL live-transport orchestration (a service loop needing
+// session state to persist across many separate poll/call cycles,
+// TCP-transport chunking, per-board scratch storage) stays board-
+// specific in each consumer -- not something a hardware-agnostic
+// package can assume.
+use "../vendor/crypto_hash/src/core.vani";
+use "../vendor/curve25519/src/core.vani";
+use "../vendor/chacha20_poly1305/src/core.vani";
+
+// Heap-pointer API (below, after the self-test) needs these two raw
+// byte accessors -- this project's own established calling convention
+// for `mut ref i64` heap-pointer buffers, matching DhruvaOS's own
+// buf_read_byte/buf_write_byte (boot/dharafs_buf.S on Pi 1, boot/
+// rpi4/runtime_stubs_rpi4.c's C port on Pi 4/5). A consumer vendoring
+// this package on a board that already defines these (both DhruvaOS
+// boards do) gets them for free via the same extern "C" link; the
+// package's own host test below supplies a trivial reference
+// implementation so `vanic run`/`--backend=c` can link standalone.
+extern "C" fn buf_write_byte(buf: mut ref i64, offset: u32, value: u32) -> u32;
+extern "C" fn buf_read_byte(buf: mut ref i64, offset: u32) -> u32;
+
+// ==================================================================
+// Round 166 (TLS 1.3 port to Pi 4/5), Phase 1: pure protocol/crypto-
+// orchestration logic -- record layer, key schedule, handshake
+// message builders -- no scratch-buffer/heap dependency at all,
+// everything threaded through function parameters/returns as fixed-
+// size local arrays, matching this board's own established heap-free
+// style (curve25519/chacha20_poly1305's own array-based return-by-
+// value convention). Faithful port of kernel_main.vani's own TLS 1.3
+// implementation (TLS_CHACHA20_POLY1305_SHA256 / X25519 / Ed25519 /
+// RFC 7250 raw public keys) -- every wire-format constant, HKDF
+// label, and message-building byte sequence below is copied directly
+// from that file, not re-derived. The STATEFUL live-transport
+// orchestration (tls_service/tls_connect/tls_accept/tls_send/
+// tls_recv, needing session state to persist across many separate
+// poll/call cycles) is Phase 2, a separate addition needing its own
+// new boot/rpi4/tls13_scratch.S persistent-storage file.
+// ==================================================================
+
+// --- Wire-format helpers ---
+
+fn tls_write_u8(buf: mut ref [u8; 512], pos: i64, v: i64) -> i64 {
+  buf[pos] = (v & 255) as u8;
+  return pos + 1;
+}
+
+fn tls_write_u16(buf: mut ref [u8; 512], pos: i64, v: i64) -> i64 {
+  buf[pos] = ((v >> 8) & 255) as u8;
+  buf[pos + 1] = (v & 255) as u8;
+  return pos + 2;
+}
+
+fn tls_write_u24(buf: mut ref [u8; 512], pos: i64, v: i64) -> i64 {
+  buf[pos] = ((v >> 16) & 255) as u8;
+  buf[pos + 1] = ((v >> 8) & 255) as u8;
+  buf[pos + 2] = (v & 255) as u8;
+  return pos + 3;
+}
+
+fn tls_write_bytes32(buf: mut ref [u8; 512], pos: i64, src: ref [u8; 32]) -> i64 {
+  let i: i64 = 0;
+  while i < 32 {
+    buf[pos + i] = src[i];
+    i = i + 1;
+  }
+  return pos + 32;
+}
+
+fn tls_write_bytes64(buf: mut ref [u8; 512], pos: i64, src: ref [u8; 64]) -> i64 {
+  let i: i64 = 0;
+  while i < 64 {
+    buf[pos + i] = src[i];
+    i = i + 1;
+  }
+  return pos + 64;
+}
+
+fn tls_basepoint32() -> [u8; 32] {
+  let out: [u8; 32] = [0 as u8; 32];
+  out[0] = 9 as u8;
+  return out;
+}
+
+fn tls_bytes_equal32(a: ref [u8; 32], b: ref [u8; 32]) -> i64 {
+  let i: i64 = 0;
+  while i < 32 {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// General-purpose N-byte compare for record content-round-trip
+// checks (record/message lengths vary; the 32-byte-fixed
+// tls_bytes_equal32 above only covers key/hash-shaped compares).
+fn tls_bytes_equal512(a: ref [u8; 512], b: ref [u8; 512], n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if a[i] != b[i] {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// --- Handshake message builders (RFC 8446 4.1.2/4.1.3/4.3.1/4.3.2/
+// 4.4.4) -- wire layout and byte counts copied directly from
+// kernel_main.vani's own tls_build_* functions (themselves derived
+// from that round's own tls13_ref.py). ---
+
+fn tls_build_client_hello(client_random: ref [u8; 32], client_pub: ref [u8; 32], out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  o = tls_write_u8(out, o, 1);
+  o = tls_write_u24(out, o, 108);
+  o = tls_write_u16(out, o, 0x0303);
+  o = tls_write_bytes32(out, o, client_random);
+  o = tls_write_u8(out, o, 0);
+  o = tls_write_u16(out, o, 2);
+  o = tls_write_u16(out, o, 0x1303);
+  o = tls_write_u8(out, o, 1);
+  o = tls_write_u8(out, o, 0);
+  o = tls_write_u16(out, o, 65);
+  o = tls_write_u16(out, o, 43);
+  o = tls_write_u16(out, o, 3);
+  o = tls_write_u8(out, o, 2);
+  o = tls_write_u16(out, o, 0x0304);
+  o = tls_write_u16(out, o, 10);
+  o = tls_write_u16(out, o, 4);
+  o = tls_write_u16(out, o, 2);
+  o = tls_write_u16(out, o, 0x001D);
+  o = tls_write_u16(out, o, 13);
+  o = tls_write_u16(out, o, 4);
+  o = tls_write_u16(out, o, 2);
+  o = tls_write_u16(out, o, 0x0807);
+  o = tls_write_u16(out, o, 51);
+  o = tls_write_u16(out, o, 38);
+  o = tls_write_u16(out, o, 36);
+  o = tls_write_u16(out, o, 0x001D);
+  o = tls_write_u16(out, o, 32);
+  o = tls_write_bytes32(out, o, client_pub);
+  return o;
+}
+
+fn tls_build_server_hello(server_random: ref [u8; 32], server_pub: ref [u8; 32], out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  o = tls_write_u8(out, o, 2);
+  o = tls_write_u24(out, o, 86);
+  o = tls_write_u16(out, o, 0x0303);
+  o = tls_write_bytes32(out, o, server_random);
+  o = tls_write_u8(out, o, 0);
+  o = tls_write_u16(out, o, 0x1303);
+  o = tls_write_u8(out, o, 0);
+  o = tls_write_u16(out, o, 46);
+  o = tls_write_u16(out, o, 43);
+  o = tls_write_u16(out, o, 2);
+  o = tls_write_u16(out, o, 0x0304);
+  o = tls_write_u16(out, o, 51);
+  o = tls_write_u16(out, o, 36);
+  o = tls_write_u16(out, o, 0x001D);
+  o = tls_write_u16(out, o, 32);
+  o = tls_write_bytes32(out, o, server_pub);
+  return o;
+}
+
+fn tls_build_encrypted_extensions(out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  o = tls_write_u8(out, o, 8);
+  o = tls_write_u24(out, o, 2);
+  o = tls_write_u16(out, o, 0);
+  return o;
+}
+
+fn tls_build_certificate(raw_pubkey: ref [u8; 32], out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  o = tls_write_u8(out, o, 11);
+  o = tls_write_u24(out, o, 41);
+  o = tls_write_u8(out, o, 0);
+  o = tls_write_u24(out, o, 37);
+  o = tls_write_u24(out, o, 32);
+  o = tls_write_bytes32(out, o, raw_pubkey);
+  o = tls_write_u16(out, o, 0);
+  return o;
+}
+
+fn tls_build_certificate_verify(sig: ref [u8; 64], out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  o = tls_write_u8(out, o, 15);
+  o = tls_write_u24(out, o, 68);
+  o = tls_write_u16(out, o, 0x0807);
+  o = tls_write_u16(out, o, 64);
+  o = tls_write_bytes64(out, o, sig);
+  return o;
+}
+
+fn tls_build_finished(verify_data: ref [u8; 32], out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  o = tls_write_u8(out, o, 20);
+  o = tls_write_u24(out, o, 32);
+  o = tls_write_bytes32(out, o, verify_data);
+  return o;
+}
+
+// RFC 8446 4.4.3: 64 spaces || context string || 0x00 || transcript hash.
+fn tls_certverify_signed_content(transcript_hash: ref [u8; 32], out: mut ref [u8; 512]) -> i64 {
+  let o: i64 = 0;
+  let pad_i: i64 = 0;
+  while pad_i < 64 {
+    out[o] = 0x20 as u8;
+    o = o + 1;
+    pad_i = pad_i + 1;
+  }
+  let ctx: Str = "TLS 1.3, server CertificateVerify";
+  let ctx_len: i64 = str_len_bytes(ctx);
+  let ctx_i: i64 = 0;
+  while ctx_i < ctx_len {
+    out[o + ctx_i] = str_byte_at(ctx, ctx_i) as u8;
+    ctx_i = ctx_i + 1;
+  }
+  o = o + ctx_len;
+  o = tls_write_u8(out, o, 0);
+  o = tls_write_bytes32(out, o, transcript_hash);
+  return o;
+}
+
+// --- HMAC-SHA256 / HKDF (RFC 2104 / RFC 5869) ---
+// Single HMAC implementation (unlike kernel_main.vani's own two,
+// which stayed separate there purely to avoid touching an already-
+// shipped narrower primitive) -- this is a fresh Pi4/5 port, so one
+// 256-byte-capped HMAC covers every real call site here (every actual
+// message HMAC-SHA256 hashes in this file's own key schedule is well
+// under 256 bytes -- see tls_build_hkdf_label's own comment).
+// Every TLS 1.3 key-schedule secret/PRK is always exactly 32 bytes
+// (a SHA-256 output), so the ">64-byte key, hash it down first"
+// branch kernel_main.vani's own general-purpose hmac_sha256 also
+// needs is never reachable here and is deliberately not ported.
+fn tls_hmac_sha256(key: ref [u8; 32], msg: ref [u8; 256], msg_len: i64) -> [u8; 32] {
+  let key_block: [u8; 256] = [0 as u8; 256];
+  let i: i64 = 0;
+  while i < 32 {
+    key_block[i] = key[i];
+    i = i + 1;
+  }
+
+  let msg_scratch: [u8; 256] = [0 as u8; 256];
+  i = 0;
+  while i < 64 {
+    msg_scratch[i] = key_block[i] ^ (0x36 as u8);
+    i = i + 1;
+  }
+  i = 0;
+  while i < msg_len {
+    msg_scratch[64 + i] = msg[i];
+    i = i + 1;
+  }
+  // sha256_hash (the one-shot convenience wrapper) is deliberately
+  // NOT used here -- it lives only in crypto_hash's lib.vani, not
+  // core.vani, and Pi 1 vendors core.vani (its own board-side code
+  // already defines several names lib.vani's self-tests would
+  // collide with). Built directly on the streaming API instead
+  // (init/update/finalize), present in both -- both inputs here are
+  // always well under one 256-byte chunk, so a single sha256_update
+  // call is a genuine one-shot hash, not a real streaming loop.
+  let inner_ctx0: Sha256Ctx = sha256_init();
+  let inner_ctx1: Sha256Ctx = sha256_update(ref inner_ctx0, mut ref msg_scratch, 64 + msg_len);
+  let inner_hash: [u8; 32] = sha256_finalize(ref inner_ctx1);
+
+  let msg_scratch2: [u8; 256] = [0 as u8; 256];
+  i = 0;
+  while i < 64 {
+    msg_scratch2[i] = key_block[i] ^ (0x5c as u8);
+    i = i + 1;
+  }
+  i = 0;
+  while i < 32 {
+    msg_scratch2[64 + i] = inner_hash[i];
+    i = i + 1;
+  }
+  let outer_ctx0: Sha256Ctx = sha256_init();
+  let outer_ctx1: Sha256Ctx = sha256_update(ref outer_ctx0, mut ref msg_scratch2, 96);
+  let out: [u8; 32] = sha256_finalize(ref outer_ctx1);
+  return out;
+}
+
+fn tls_hkdf_extract(salt: ref [u8; 32], ikm: ref [u8; 32]) -> [u8; 32] {
+  let ikm_buf: [u8; 256] = [0 as u8; 256];
+  let i: i64 = 0;
+  while i < 32 {
+    ikm_buf[i] = ikm[i];
+    i = i + 1;
+  }
+  return tls_hmac_sha256(salt, ref ikm_buf, 32);
+}
+
+struct TlsHkdfLabelResult { buf: [u8; 512], span_len: i64 }
+
+// HkdfLabel struct (RFC 8446 7.1): 2-byte length, length-prefixed
+// "tls13 "+label, length-prefixed context. Max realistic size here:
+// 2+1+(6+13)+1+32 = 55 bytes ("s ap traffic" is the longest label
+// used) -- comfortably fits the 256-byte HMAC message cap this file's
+// own tls_hmac_sha256 assumes.
+fn tls_build_hkdf_label(label: Str, context: ref [u8; 32], context_len: i64, length: i64) -> TlsHkdfLabelResult {
+  let buf: [u8; 512] = [0 as u8; 512];
+  let o: i64 = 0;
+  o = tls_write_u16(mut ref buf, o, length);
+  let prefix: Str = "tls13 ";
+  let prefix_len: i64 = str_len_bytes(prefix);
+  let label_len: i64 = str_len_bytes(label);
+  let full_label_len: i64 = prefix_len + label_len;
+  o = tls_write_u8(mut ref buf, o, full_label_len);
+  let pfx_i: i64 = 0;
+  while pfx_i < prefix_len {
+    buf[o + pfx_i] = str_byte_at(prefix, pfx_i) as u8;
+    pfx_i = pfx_i + 1;
+  }
+  o = o + prefix_len;
+  let lbl_i: i64 = 0;
+  while lbl_i < label_len {
+    buf[o + lbl_i] = str_byte_at(label, lbl_i) as u8;
+    lbl_i = lbl_i + 1;
+  }
+  o = o + label_len;
+  o = tls_write_u8(mut ref buf, o, context_len);
+  let ci: i64 = 0;
+  while ci < context_len {
+    buf[o + ci] = context[ci];
+    ci = ci + 1;
+  }
+  o = o + context_len;
+  return TlsHkdfLabelResult { buf: buf, span_len: o };
+}
+
+// HKDF-Expand (RFC 5869 2.3): T(0)=empty, T(i)=HMAC(PRK, T(i-1) ||
+// info || i), OKM = T(1)||T(2)||... truncated to out_len. out_len is
+// always 12 or 32 here (an IV or a key/secret), so a 32-byte output
+// buffer always has enough room.
+fn tls_hkdf_expand(prk: ref [u8; 32], hklabel: ref [u8; 512], hklabel_len: i64, out_len: i64) -> [u8; 32] {
+  let t: [u8; 32] = [0 as u8; 32];
+  let t_len: i64 = 0;
+  let out: [u8; 32] = [0 as u8; 32];
+  let produced: i64 = 0;
+  let counter: i64 = 1;
+  while produced < out_len {
+    let hmac_input: [u8; 256] = [0 as u8; 256];
+    let i: i64 = 0;
+    while i < t_len {
+      hmac_input[i] = t[i];
+      i = i + 1;
+    }
+    let j: i64 = 0;
+    while j < hklabel_len {
+      hmac_input[t_len + j] = hklabel[j];
+      j = j + 1;
+    }
+    hmac_input[t_len + hklabel_len] = counter as u8;
+    let input_len: i64 = t_len + hklabel_len + 1;
+
+    t = tls_hmac_sha256(prk, ref hmac_input, input_len);
+    t_len = 32;
+
+    let take: i64 = if (out_len - produced) < 32 { out_len - produced } else { 32 };
+    let k: i64 = 0;
+    while k < take {
+      out[produced + k] = t[k];
+      k = k + 1;
+    }
+    produced = produced + take;
+    counter = counter + 1;
+  }
+  return out;
+}
+
+fn tls_hkdf_expand_label(secret: ref [u8; 32], label: Str, context: ref [u8; 32], context_len: i64, length: i64) -> [u8; 32] {
+  let hl: TlsHkdfLabelResult = tls_build_hkdf_label(label, context, context_len, length);
+  let hl_bytes: [u8; 512] = hl.buf;
+  let hl_len: i64 = hl.span_len;
+  return tls_hkdf_expand(secret, ref hl_bytes, hl_len, length);
+}
+
+// --- Transcript hashing (streams through crypto_hash's own
+// Sha256Ctx, since the transcript can exceed sha256_hash's own
+// 256-byte one-shot cap once several handshake messages have
+// accumulated) ---
+
+// Hand-unrolled into up to 4 distinctly-named Sha256Ctx bindings
+// (ctx0 -> ctx1 -> ctx2 -> ctx3 -> ctx4) rather than a loop that
+// reassigns a single `ctx` variable to itself (`ctx = sha256_update
+// (ref ctx, ...)`), matching crypto_hash's own `sha256_streaming_
+// self_test` shape, which never does `ctxN = sha256_update(ref ctxN,
+// ...)` either. (Round 166 tried this as a fix for a live boot
+// regression and it did NOT change the outcome -- the actual root
+// cause was a boot-stack overflow, see boot/rpi4/link.ld's own
+// comment -- but the fresh-name-per-step shape is kept anyway since
+// it matches the package's established convention.) 4 chunks of 256
+// bytes covers every real transcript this file ever builds (max ~400
+// bytes through server Finished) with comfortable headroom up to
+// 1024.
+fn tls_hash_transcript(transcript: ref [u8; 1024], transcript_len: i64) -> [u8; 32] {
+  let ctx0: Sha256Ctx = sha256_init();
+  let chunk0: [u8; 256] = [0 as u8; 256];
+  let take0: i64 = if transcript_len < 256 { transcript_len } else { 256 };
+  let i: i64 = 0;
+  while i < take0 { chunk0[i] = transcript[i]; i = i + 1; }
+  let ctx1: Sha256Ctx = sha256_update(ref ctx0, mut ref chunk0, take0);
+  if transcript_len <= 256 {
+    return sha256_finalize(ref ctx1);
+  }
+
+  let chunk1: [u8; 256] = [0 as u8; 256];
+  let take1: i64 = if (transcript_len - 256) < 256 { transcript_len - 256 } else { 256 };
+  i = 0;
+  while i < take1 { chunk1[i] = transcript[256 + i]; i = i + 1; }
+  let ctx2: Sha256Ctx = sha256_update(ref ctx1, mut ref chunk1, take1);
+  if transcript_len <= 512 {
+    return sha256_finalize(ref ctx2);
+  }
+
+  let chunk2: [u8; 256] = [0 as u8; 256];
+  let take2: i64 = if (transcript_len - 512) < 256 { transcript_len - 512 } else { 256 };
+  i = 0;
+  while i < take2 { chunk2[i] = transcript[512 + i]; i = i + 1; }
+  let ctx3: Sha256Ctx = sha256_update(ref ctx2, mut ref chunk2, take2);
+  if transcript_len <= 768 {
+    return sha256_finalize(ref ctx3);
+  }
+
+  let chunk3: [u8; 256] = [0 as u8; 256];
+  let take3: i64 = if (transcript_len - 768) < 256 { transcript_len - 768 } else { 256 };
+  i = 0;
+  while i < take3 { chunk3[i] = transcript[768 + i]; i = i + 1; }
+  let ctx4: Sha256Ctx = sha256_update(ref ctx3, mut ref chunk3, take3);
+  return sha256_finalize(ref ctx4);
+}
+
+// Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret,
+// Label, Transcript-Hash(Messages), Hash.length). transcript_len=0 is
+// a real, meaningful case (Transcript-Hash of the empty message, used
+// by the "derived" label) -- NOT a no-op skip.
+fn tls_derive_secret(secret: ref [u8; 32], label: Str, transcript: ref [u8; 1024], transcript_len: i64) -> [u8; 32] {
+  let th: [u8; 32] = tls_hash_transcript(transcript, transcript_len);
+  return tls_hkdf_expand_label(secret, label, ref th, 32, 32);
+}
+
+struct TlsTrafficKeys { key: [u8; 32], iv: [u8; 12] }
+
+fn tls_derive_traffic_keys(secret: ref [u8; 32]) -> TlsTrafficKeys {
+  let dummy: [u8; 32] = [0 as u8; 32];
+  let key32: [u8; 32] = tls_hkdf_expand_label(secret, "key", ref dummy, 0, 32);
+  let iv32: [u8; 32] = tls_hkdf_expand_label(secret, "iv", ref dummy, 0, 12);
+  let iv: [u8; 12] = [0 as u8; 12];
+  let i: i64 = 0;
+  while i < 12 {
+    iv[i] = iv32[i];
+    i = i + 1;
+  }
+  return TlsTrafficKeys { key: key32, iv: iv };
+}
+
+// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", 32);
+// verify_data = HMAC(finished_key, Transcript-Hash(Messages)).
+fn tls_finished_verify_data(traffic_secret: ref [u8; 32], transcript: ref [u8; 1024], transcript_len: i64) -> [u8; 32] {
+  let dummy: [u8; 32] = [0 as u8; 32];
+  let fk: [u8; 32] = tls_hkdf_expand_label(traffic_secret, "finished", ref dummy, 0, 32);
+  let th: [u8; 32] = tls_hash_transcript(transcript, transcript_len);
+  let th_buf: [u8; 256] = [0 as u8; 256];
+  let i: i64 = 0;
+  while i < 32 {
+    th_buf[i] = th[i];
+    i = i + 1;
+  }
+  return tls_hmac_sha256(ref fk, ref th_buf, 32);
+}
+
+// --- Record layer (RFC 8446 5.2/5.3) ---
+
+// nonce = static_iv XOR (seq_num, big-endian, zero-padded to 12
+// bytes).
+fn tls_record_nonce(static_iv: ref [u8; 12], seq: i64) -> [u8; 12] {
+  let out: [u8; 12] = [0 as u8; 12];
+  let i: i64 = 0;
+  while i < 8 {
+    out[i] = static_iv[i];
+    i = i + 1;
+  }
+  let b3: i64 = (seq >> 24) & 255;
+  let b2: i64 = (seq >> 16) & 255;
+  let b1: i64 = (seq >> 8) & 255;
+  let b0: i64 = seq & 255;
+  out[8] = ((static_iv[8] as i64) ^ b3) as u8;
+  out[9] = ((static_iv[9] as i64) ^ b2) as u8;
+  out[10] = ((static_iv[10] as i64) ^ b1) as u8;
+  out[11] = ((static_iv[11] as i64) ^ b0) as u8;
+  return out;
+}
+
+struct TlsEncryptResult { rec: [u8; 512], span_len: i64 }
+
+// TLSInnerPlaintext = content || real_content_type (no padding); AAD
+// = the 5-byte TLSCiphertext header. Returns the total rec
+// (5-byte header + ciphertext + 16-byte tag).
+fn tls_encrypt_record(key: ref [u8; 32], static_iv: ref [u8; 12], seq: i64, content: ref [u8; 512], content_len: i64, content_type: i64) -> TlsEncryptResult {
+  let inner: [u8; 512] = [0 as u8; 512];
+  let i: i64 = 0;
+  while i < content_len {
+    inner[i] = content[i];
+    i = i + 1;
+  }
+  inner[content_len] = content_type as u8;
+  let inner_len: i64 = content_len + 1;
+
+  let record_len_field: i64 = inner_len + 16;
+  let aad: [u8; 64] = [0 as u8; 64];
+  aad[0] = 0x17 as u8;
+  aad[1] = 0x03 as u8;
+  aad[2] = 0x03 as u8;
+  aad[3] = ((record_len_field / 256) & 255) as u8;
+  aad[4] = (record_len_field & 255) as u8;
+
+  let nonce: [u8; 12] = tls_record_nonce(static_iv, seq);
+  let enc: AeadEncryptResult = chacha20_poly1305_encrypt(key, ref nonce, ref aad, 5, ref inner, inner_len);
+
+  let out: [u8; 512] = [0 as u8; 512];
+  let j: i64 = 0;
+  while j < 5 {
+    out[j] = aad[j];
+    j = j + 1;
+  }
+  let ct: [u8; 512] = enc.ciphertext;
+  let tag: [u8; 16] = enc.tag;
+  j = 0;
+  while j < inner_len {
+    out[5 + j] = ct[j];
+    j = j + 1;
+  }
+  j = 0;
+  while j < 16 {
+    out[5 + inner_len + j] = tag[j];
+    j = j + 1;
+  }
+  return TlsEncryptResult { rec: out, span_len: 5 + inner_len + 16 };
+}
+
+struct TlsDecryptResult { ok: i64, content: [u8; 512], span_len: i64 }
+
+// Decrypts `rec` (record_len bytes) and verifies its inner content
+// type equals `expected_content_type` -- reject, don't guess.
+fn tls_decrypt_record(key: ref [u8; 32], static_iv: ref [u8; 12], seq: i64, rec_data: ref [u8; 512], record_len: i64, expected_content_type: i64) -> TlsDecryptResult {
+  let ct_len: i64 = record_len - 5 - 16;
+  let empty: [u8; 512] = [0 as u8; 512];
+  if ct_len < 0 {
+    return TlsDecryptResult { ok: 0, content: empty, span_len: 0 };
+  }
+  let aad: [u8; 64] = [0 as u8; 64];
+  let i: i64 = 0;
+  while i < 5 {
+    aad[i] = rec_data[i];
+    i = i + 1;
+  }
+  let ct_scratch: [u8; 512] = [0 as u8; 512];
+  i = 0;
+  while i < ct_len {
+    ct_scratch[i] = rec_data[5 + i];
+    i = i + 1;
+  }
+  let tag_in: [u8; 16] = [0 as u8; 16];
+  i = 0;
+  while i < 16 {
+    tag_in[i] = rec_data[5 + ct_len + i];
+    i = i + 1;
+  }
+
+  let nonce: [u8; 12] = tls_record_nonce(static_iv, seq);
+  let dec: AeadDecryptResult = chacha20_poly1305_decrypt(key, ref nonce, ref aad, 5, ref ct_scratch, ct_len, ref tag_in);
+  if dec.ok != 1 {
+    return TlsDecryptResult { ok: 0, content: empty, span_len: 0 };
+  }
+  let plaintext: [u8; 512] = dec.plaintext;
+  let content_len: i64 = ct_len - 1;
+  let content_type: i64 = plaintext[content_len] as i64;
+  if content_type != expected_content_type {
+    return TlsDecryptResult { ok: 0, content: empty, span_len: 0 };
+  }
+  let out_content: [u8; 512] = [0 as u8; 512];
+  i = 0;
+  while i < content_len {
+    out_content[i] = plaintext[i];
+    i = i + 1;
+  }
+  return TlsDecryptResult { ok: 1, content: out_content, span_len: content_len };
+}
+
+// Live, both-roles TLS 1.3 handshake + application-data round trip
+// (TLS_CHACHA20_POLY1305_SHA256 / x25519 / ed25519 / RFC 7250 raw
+// public keys). Same deterministic test vectors as kernel_main.vani's
+// own tls_self_test, so this is directly comparable against that
+// board's own verified reference.
+//
+// Stack-economy note: interleaves each message's build -> transcript-
+// copy -> (round-trip encrypt/decrypt verify) into one phase before
+// moving to the next, reusing a small handful of shared [u8;512]/
+// TlsEncryptResult/TlsDecryptResult scratch locals across every phase
+// instead of giving each message/round-trip its own distinctly-named
+// buffer. This is a pure reordering (build-then-verify-immediately
+// instead of build-everything-then-verify-everything) with no
+// semantic effect on what's being tested. Same stack-budget lesson as
+// round 109's own mqttecho fix on Pi 1 (a naive first draft with ~20
+// distinct [u8;512]-shaped locals live at once overflowed this
+// board's own 16KB boot stack -- boot/rpi4/link.ld's own comment --
+// silently, with no fault message, since Pi 4/5 has no bounded-stack
+// checker at all to catch this at compile time the way Pi 1's
+// #[bounded_stack] annotations do).
+
+// --- Heap-pointer API (Pi 1 style) ---
+//
+// Round 174: a second API surface alongside the fixed-[u8;512]-array
+// one above, so a consumer whose real message/record sizes exceed 512
+// bytes (Pi 1's TLS records run up to 2048 bytes) can use this
+// package too, now that both DhruvaOS boards have a real heap
+// allocator (Pi 1's `dhruva_alloc_bytes`; Pi 4/5's `dhruva_alloc_
+// bytes_rpi4`, added round 179). Every function here takes `mut ref
+// i64` heap-pointer parameters (this project's established calling
+// convention for heap buffers, paired with the `buf_read_byte`/
+// `buf_write_byte` accessors) instead of a fixed array, for whichever
+// parameter must scale with real message/record content.
+//
+// Most of these are thin bridging shims over the array-based API
+// above, not reimplementations: every TLS 1.3 handshake message is
+// small and bounded regardless of a board's own record-size ceiling
+// (the largest, ClientHello, is ~113 bytes), so a shim reads the
+// heap-pointer inputs into small local arrays, calls the existing
+// array-based builder, and copies its result out to the heap `out`
+// pointer. Genuinely new logic exists only where the DATA ITSELF is
+// unbounded: transcript hashing (`tls_hash_transcript_heap`, a
+// streaming SHA-256 over an arbitrary-length heap buffer, since a
+// real transcript accumulating several handshake messages can exceed
+// the array API's own 1024-byte cap) and the AEAD record layer
+// (`tls_encrypt_record_heap`/`tls_decrypt_record_heap`, content up to
+// whatever the caller's real record size is) -- both built directly
+// on chacha20_poly1305's/crypto_hash's own already-vendored STREAMING
+// primitives (`chacha20_xor_chunk`/`Poly1305Ctx`/`Sha256Ctx`), which
+// have no length cap at all.
+
+fn tls_copy_heap(dst: mut ref i64, dst_off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64 {
+  let ci: i64 = 0;
+  while ci < n {
+    let _ = buf_write_byte(dst, (dst_off + ci) as u32, buf_read_byte(src, (src_off + ci) as u32));
+    ci = ci + 1;
+  }
+  return dst_off + n;
+}
+
+fn tls_put_u8_heap(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, v & (255 as u32));
+  return off + 1;
+}
+
+fn tls_put_u16_heap(buf: mut ref i64, off: i64, v: u32) -> i64 {
+  let _ = buf_write_byte(buf, off as u32, (v >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, v & (255 as u32));
+  return off + 2;
+}
+
+fn tls_put_u24_heap(buf: mut ref i64, off: i64, v: i64) -> i64 {
+  let vu: u32 = v as u32;
+  let _ = buf_write_byte(buf, off as u32, (vu >> (16 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 1) as u32, (vu >> (8 as u32)) & (255 as u32));
+  let _ = buf_write_byte(buf, (off + 2) as u32, vu & (255 as u32));
+  return off + 3;
+}
+
+fn tls_x25519_basepoint_heap(out: mut ref i64) -> i64 {
+  let bp: [u8; 32] = tls_basepoint32();
+  let i: i64 = 0;
+  while i < 32 {
+    let _ = buf_write_byte(out, i as u32, bp[i] as u32);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn tls_bytes_equal_heap(a: mut ref i64, b: mut ref i64, n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    if buf_read_byte(a, i as u32) != buf_read_byte(b, i as u32) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn tls_read32_heap(src: mut ref i64) -> [u8; 32] {
+  let out: [u8; 32] = [0 as u8; 32];
+  let i: i64 = 0;
+  while i < 32 {
+    out[i] = buf_read_byte(src, i as u32) as u8;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn tls_read64_heap(src: mut ref i64) -> [u8; 64] {
+  let out: [u8; 64] = [0 as u8; 64];
+  let i: i64 = 0;
+  while i < 64 {
+    out[i] = buf_read_byte(src, i as u32) as u8;
+    i = i + 1;
+  }
+  return out;
+}
+
+fn tls_write_result_heap(out: mut ref i64, src: ref [u8; 512], n: i64) -> i64 {
+  let i: i64 = 0;
+  while i < n {
+    let _ = buf_write_byte(out, i as u32, src[i] as u32);
+    i = i + 1;
+  }
+  return n;
+}
+
+fn tls_build_client_hello_heap(client_random: mut ref i64, client_pub: mut ref i64, out: mut ref i64) -> i64 {
+  let cr: [u8; 32] = tls_read32_heap(client_random);
+  let cp: [u8; 32] = tls_read32_heap(client_pub);
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_build_client_hello(ref cr, ref cp, mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+fn tls_build_server_hello_heap(server_random: mut ref i64, server_pub: mut ref i64, out: mut ref i64) -> i64 {
+  let sr: [u8; 32] = tls_read32_heap(server_random);
+  let sp: [u8; 32] = tls_read32_heap(server_pub);
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_build_server_hello(ref sr, ref sp, mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+fn tls_build_encrypted_extensions_heap(out: mut ref i64) -> i64 {
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_build_encrypted_extensions(mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+fn tls_build_certificate_heap(raw_pubkey: mut ref i64, out: mut ref i64) -> i64 {
+  let pk: [u8; 32] = tls_read32_heap(raw_pubkey);
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_build_certificate(ref pk, mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+fn tls_build_certificate_verify_heap(sig: mut ref i64, out: mut ref i64) -> i64 {
+  let s: [u8; 64] = tls_read64_heap(sig);
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_build_certificate_verify(ref s, mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+fn tls_build_finished_heap(verify_data: mut ref i64, out: mut ref i64) -> i64 {
+  let vd: [u8; 32] = tls_read32_heap(verify_data);
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_build_finished(ref vd, mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+fn tls_certverify_signed_content_heap(transcript_hash: mut ref i64, out: mut ref i64) -> i64 {
+  let th: [u8; 32] = tls_read32_heap(transcript_hash);
+  let buf: [u8; 512] = [0 as u8; 512];
+  let n: i64 = tls_certverify_signed_content(ref th, mut ref buf);
+  return tls_write_result_heap(out, ref buf, n);
+}
+
+// Streaming SHA-256 over an arbitrary-length heap buffer -- the one
+// place this file genuinely needs new logic instead of a bridging
+// shim, since `tls_hash_transcript` above caps out at 1024 bytes and
+// a real accumulated transcript (several handshake messages
+// concatenated) can exceed that on a board with a larger per-record
+// ceiling than the 512-byte one this package's own self-test uses.
+// Built directly on crypto_hash's own Sha256Ctx streaming API (no
+// length cap at all), reading 256-byte chunks through buf_read_byte.
+fn tls_hash_transcript_heap(transcript: mut ref i64, transcript_len: i64) -> [u8; 32] {
+  let ctx: Sha256Ctx = sha256_init();
+  let offset: i64 = 0;
+  while offset < transcript_len {
+    let remaining: i64 = transcript_len - offset;
+    let chunk_n: i64 = if remaining < 256 { remaining } else { 256 };
+    let chunk: [u8; 256] = [0 as u8; 256];
+    let i: i64 = 0;
+    while i < chunk_n {
+      chunk[i] = buf_read_byte(transcript, (offset + i) as u32) as u8;
+      i = i + 1;
+    }
+    ctx = sha256_update(ref ctx, mut ref chunk, chunk_n);
+    offset = offset + chunk_n;
+  }
+  return sha256_finalize(ref ctx);
+}
+
+fn tls_derive_secret_heap(secret: mut ref i64, label: Str, transcript: mut ref i64, transcript_len: i64) -> [u8; 32] {
+  let s: [u8; 32] = tls_read32_heap(secret);
+  let th: [u8; 32] = tls_hash_transcript_heap(transcript, transcript_len);
+  return tls_hkdf_expand_label(ref s, label, ref th, 32, 32);
+}
+
+fn tls_finished_verify_data_heap(traffic_secret: mut ref i64, transcript: mut ref i64, transcript_len: i64) -> [u8; 32] {
+  let ts: [u8; 32] = tls_read32_heap(traffic_secret);
+  let zero32: [u8; 32] = [0 as u8; 32];
+  let fk: [u8; 32] = tls_hkdf_expand_label(ref ts, "finished", ref zero32, 0, 32);
+  let th: [u8; 32] = tls_hash_transcript_heap(transcript, transcript_len);
+  let msg256: [u8; 256] = [0 as u8; 256];
+  let i: i64 = 0;
+  while i < 32 {
+    msg256[i] = th[i];
+    i = i + 1;
+  }
+  return tls_hmac_sha256(ref fk, ref msg256, 32);
+}
+
+// AEAD record layer, built directly on chacha20_poly1305's own
+// streaming primitives (chacha20_block/chacha20_xor_chunk/Poly1305Ctx)
+// -- content/record length is whatever the caller supplies, no 512-
+// byte cap, unlike tls_encrypt_record/tls_decrypt_record above.
+fn tls_encrypt_record_heap(key: mut ref i64, static_iv: mut ref i64, seq: u32, content: mut ref i64, content_len: i64, content_type: u32, out_record: mut ref i64) -> i64 {
+  let key_arr: [u8; 32] = tls_read32_heap(key);
+  let iv_arr: [u8; 12] = [0 as u8; 12];
+  let ivi: i64 = 0;
+  while ivi < 12 {
+    iv_arr[ivi] = buf_read_byte(static_iv, ivi as u32) as u8;
+    ivi = ivi + 1;
+  }
+  let nonce: [u8; 12] = tls_record_nonce(ref iv_arr, seq as i64);
+
+  let aad: [u8; 5] = [
+    0x17 as u8, 0x03 as u8, 0x03 as u8,
+    (((content_len + 1 + 16) / 256) as u8), ((content_len + 1 + 16) as u8)
+  ];
+  let aad64: [u8; 64] = [0 as u8; 64];
+  let ai: i64 = 0;
+  while ai < 5 {
+    aad64[ai] = aad[ai];
+    ai = ai + 1;
+  }
+
+  let block0: [u8; 64] = chacha20_block(ref key_arr, 0 as u32, ref nonce);
+  let otk: [u8; 32] = cp_extract32(ref block0);
+  let inner_len: i64 = content_len + 1;
+
+  let ci: i64 = 0;
+  while ci < 5 {
+    let _ = buf_write_byte(out_record, ci as u32, aad[ci] as u32);
+    ci = ci + 1;
+  }
+
+  let counter: u32 = 1 as u32;
+  let offset: i64 = 0;
+  while offset < inner_len {
+    let remaining: i64 = inner_len - offset;
+    let this_block: i64 = if remaining < 64 { remaining } else { 64 };
+    let chunk: [u8; 64] = [0 as u8; 64];
+    let bi: i64 = 0;
+    while bi < this_block {
+      if (offset + bi) < content_len {
+        chunk[bi] = buf_read_byte(content, (offset + bi) as u32) as u8;
+      } else {
+        chunk[bi] = content_type as u8;
+      }
+      bi = bi + 1;
+    }
+    let ks_out: [u8; 64] = chacha20_xor_chunk(ref key_arr, ref nonce, counter, ref chunk, this_block);
+    let cj: i64 = 0;
+    while cj < this_block {
+      let _ = buf_write_byte(out_record, (5 + offset + cj) as u32, ks_out[cj] as u32);
+      cj = cj + 1;
+    }
+    offset = offset + 64;
+    counter = wrapping_add(counter, 1 as u32);
+  }
+
+  let ctx0: Poly1305Ctx = poly1305_init(ref otk);
+  let ctx1: Poly1305Ctx = cp_feed_padded_aad(ctx0, ref aad64, 5);
+  let ctx2: Poly1305Ctx = ctx1;
+  let pos: i64 = 0;
+  while pos < inner_len {
+    let remaining2: i64 = inner_len - pos;
+    let take: i64 = if remaining2 < 256 { remaining2 } else { 256 };
+    let mchunk: [u8; 256] = [0 as u8; 256];
+    let mi: i64 = 0;
+    while mi < take {
+      mchunk[mi] = buf_read_byte(out_record, (5 + pos + mi) as u32) as u8;
+      mi = mi + 1;
+    }
+    ctx2 = poly1305_update(ref ctx2, ref mchunk, take);
+    pos = pos + take;
+  }
+  let data_pad_len: i64 = (16 - (inner_len % 16)) % 16;
+  if data_pad_len > 0 {
+    let padchunk: [u8; 256] = [0 as u8; 256];
+    ctx2 = poly1305_update(ref ctx2, ref padchunk, data_pad_len);
+  }
+  let trailer: [u8; 16] = cp_len_trailer(5, inner_len);
+  let trailer_chunk: [u8; 256] = [0 as u8; 256];
+  let ti: i64 = 0;
+  while ti < 16 {
+    trailer_chunk[ti] = trailer[ti];
+    ti = ti + 1;
+  }
+  let ctx3: Poly1305Ctx = poly1305_update(ref ctx2, ref trailer_chunk, 16);
+  let tag: [u8; 16] = poly1305_finalize(ref ctx3);
+
+  let wi: i64 = 0;
+  while wi < 16 {
+    let _ = buf_write_byte(out_record, (5 + inner_len + wi) as u32, tag[wi] as u32);
+    wi = wi + 1;
+  }
+  return 5 + inner_len + 16;
+}
+
+fn tls_decrypt_record_heap(key: mut ref i64, static_iv: mut ref i64, seq: u32, rec_data: mut ref i64, record_len: i64, expected_content_type: u32, out_content: mut ref i64) -> i64 {
+  let ct_len: i64 = record_len - 5 - 16;
+  if ct_len < 0 {
+    return 0 - 1;
+  }
+  let key_arr: [u8; 32] = tls_read32_heap(key);
+  let iv_arr: [u8; 12] = [0 as u8; 12];
+  let ivi: i64 = 0;
+  while ivi < 12 {
+    iv_arr[ivi] = buf_read_byte(static_iv, ivi as u32) as u8;
+    ivi = ivi + 1;
+  }
+  let nonce: [u8; 12] = tls_record_nonce(ref iv_arr, seq as i64);
+
+  let aad: [u8; 5] = [
+    buf_read_byte(rec_data, 0 as u32) as u8, buf_read_byte(rec_data, 1 as u32) as u8,
+    buf_read_byte(rec_data, 2 as u32) as u8, buf_read_byte(rec_data, 3 as u32) as u8,
+    buf_read_byte(rec_data, 4 as u32) as u8
+  ];
+  let aad64: [u8; 64] = [0 as u8; 64];
+  let ai: i64 = 0;
+  while ai < 5 {
+    aad64[ai] = aad[ai];
+    ai = ai + 1;
+  }
+
+  let block0: [u8; 64] = chacha20_block(ref key_arr, 0 as u32, ref nonce);
+  let otk: [u8; 32] = cp_extract32(ref block0);
+
+  let ctx0: Poly1305Ctx = poly1305_init(ref otk);
+  let ctx1: Poly1305Ctx = cp_feed_padded_aad(ctx0, ref aad64, 5);
+  let ctx2: Poly1305Ctx = ctx1;
+  let pos: i64 = 0;
+  while pos < ct_len {
+    let remaining2: i64 = ct_len - pos;
+    let take: i64 = if remaining2 < 256 { remaining2 } else { 256 };
+    let mchunk: [u8; 256] = [0 as u8; 256];
+    let mi: i64 = 0;
+    while mi < take {
+      mchunk[mi] = buf_read_byte(rec_data, (5 + pos + mi) as u32) as u8;
+      mi = mi + 1;
+    }
+    ctx2 = poly1305_update(ref ctx2, ref mchunk, take);
+    pos = pos + take;
+  }
+  let data_pad_len: i64 = (16 - (ct_len % 16)) % 16;
+  if data_pad_len > 0 {
+    let padchunk: [u8; 256] = [0 as u8; 256];
+    ctx2 = poly1305_update(ref ctx2, ref padchunk, data_pad_len);
+  }
+  let trailer: [u8; 16] = cp_len_trailer(5, ct_len);
+  let trailer_chunk: [u8; 256] = [0 as u8; 256];
+  let ti: i64 = 0;
+  while ti < 16 {
+    trailer_chunk[ti] = trailer[ti];
+    ti = ti + 1;
+  }
+  let ctx3: Poly1305Ctx = poly1305_update(ref ctx2, ref trailer_chunk, 16);
+  let computed_tag: [u8; 16] = poly1305_finalize(ref ctx3);
+
+  let tag_in: [u8; 16] = [0 as u8; 16];
+  let tgi: i64 = 0;
+  while tgi < 16 {
+    tag_in[tgi] = buf_read_byte(rec_data, (5 + ct_len + tgi) as u32) as u8;
+    tgi = tgi + 1;
+  }
+  if poly1305_verify_constant_time(ref computed_tag, ref tag_in) == 0 {
+    return 0 - 1;
+  }
+
+  let counter: u32 = 1 as u32;
+  let offset: i64 = 0;
+  // ct_len is always >= 1 (the inner plaintext is content||content_
+  // type, so there's always at least the type byte) -- this loop
+  // always runs, so `last_byte` is always set below before use.
+  let last_byte: u32 = 0 as u32;
+  while offset < ct_len {
+    let remaining3: i64 = ct_len - offset;
+    let this_block: i64 = if remaining3 < 64 { remaining3 } else { 64 };
+    let chunk: [u8; 64] = [0 as u8; 64];
+    let ci: i64 = 0;
+    while ci < this_block {
+      chunk[ci] = buf_read_byte(rec_data, (5 + offset + ci) as u32) as u8;
+      ci = ci + 1;
+    }
+    let ks_out: [u8; 64] = chacha20_xor_chunk(ref key_arr, ref nonce, counter, ref chunk, this_block);
+    let cj: i64 = 0;
+    while cj < this_block {
+      let abs: i64 = offset + cj;
+      if abs < (ct_len - 1) {
+        let _ = buf_write_byte(out_content, abs as u32, ks_out[cj] as u32);
+      } else {
+        last_byte = ks_out[cj] as u32;
+      }
+      cj = cj + 1;
+    }
+    offset = offset + 64;
+    counter = wrapping_add(counter, 1 as u32);
+  }
+  let content_len: i64 = ct_len - 1;
+  if last_byte != expected_content_type {
+    return 0 - 1;
+  }
+  return content_len;
+}
+

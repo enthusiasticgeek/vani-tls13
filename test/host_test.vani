@@ -1,6 +1,14 @@
-// Host-runnable validation for tls13. Run with:
-//   vanic run test/host_test.vani
-//   vanic run test/host_test.vani --backend=c
+// Host-runnable validation for tls13's array API + tls13_self_test().
+//
+// `vanic run test/host_test.vani` (LLVM JIT) no longer works as of
+// round 174: src/lib.vani now also carries the heap-pointer API's
+// `extern "C" fn buf_read_byte/buf_write_byte` declarations
+// (unimplemented here by design), and the JIT needs every module-
+// level extern to resolve even though main() below never calls them.
+// `--backend=c` is a dead end too (pre-existing struct-array-field
+// bug, gap #5 in vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md).
+// Verify via LLVM-IR emission -> llc -> cc -> native run instead, same
+// as test/host_core_test.vani's own header comment documents.
 
 use "../src/lib.vani";
 
