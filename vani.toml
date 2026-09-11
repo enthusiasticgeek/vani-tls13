@@ -1,0 +1,19 @@
+[package]
+name        = "tls13"
+version     = "0.1.0"
+entry       = "src/lib.vani"
+authors     = "enthusiasticgeek"
+license     = "Apache-2.0"
+description = "TLS 1.3 (TLS_CHACHA20_POLY1305_SHA256, X25519, Ed25519, RFC 7250 raw public keys) handshake + record layer, pure vani, hardware-agnostic and heap-free -- fixed-size array parameters, no allocator, no extern \"C\" dependency. Extracted from DhruvaOS's Pi 4/5 port so any consumer (Pi 1 included) can share one implementation instead of each board keeping its own copy."
+registry    = "kosh"
+
+[deps]
+# Intentionally EMPTY -- crypto_hash, curve25519, and chacha20_poly1305
+# are vendored at ./vendor/<name> and pulled in by src/lib.vani via
+# direct relative `use` statements, not [deps] entries, for the same
+# reason vani-pki/vani-curve25519 don't declare their own deps that
+# way either: a real vani-compiler bug (BUG-234, vani-compiler/docs/
+# TODO_CURRENT.md) breaks internal name resolution for any
+# [deps]-vendored package whose own code assigns a function call's
+# result into an array element (`buf[i] = helper(...)`), which SHA-256
+# /512's compression loops do throughout.

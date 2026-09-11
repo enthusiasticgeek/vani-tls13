@@ -1,0 +1,11 @@
+// Host-runnable validation for tls13. Run with:
+//   vanic run test/host_test.vani
+//   vanic run test/host_test.vani --backend=c
+
+use "../src/lib.vani";
+
+fn main() -> i64 {
+  assert tls13_self_test() == 1;
+  print "tls13: TLS 1.3 handshake + app data round trip self-test PASS";
+  return 0;
+}
