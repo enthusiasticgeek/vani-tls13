@@ -8,7 +8,9 @@ Extracted from [Dhruva OS](https://github.com/enthusiasticgeek/dhruvaos)'s
 Pi 4/5 port (round 166), itself a faithful port of DhruvaOS's Pi 1
 kernel's own original TLS 1.3 implementation — so both boards, and any
 future one, share this one implementation instead of each keeping its
-own copy.
+own copy. Round 174 completed that circle: added a second,
+heap-pointer API (below) and migrated Pi 1's own kernel onto it too,
+so both boards now genuinely share one implementation.
 
 ## Scope
 
@@ -77,6 +79,52 @@ fn tls_decrypt_record(key: ref [u8; 32], static_iv: ref [u8; 12], seq: i64, rec_
 fn tls13_self_test() -> i64   // 1 = pass, 0 = fail; no I/O side effects
 ```
 
+### Heap-pointer API (round 174)
+
+A second surface for a consumer whose real record sizes exceed 512
+bytes (Pi 1's own TLS records run up to 2048 bytes) -- now that both
+DhruvaOS boards have a real heap allocator, both can use this one
+package. Every `_heap` function takes `mut ref i64` for whichever
+parameter must scale with real content, paired with the project's own
+`buf_read_byte`/`buf_write_byte` byte accessors (declared `extern "C"`
+here -- a consumer vendoring this package already provides them, e.g.
+`boot/dharafs_buf.S` on Pi 1, `boot/rpi4/runtime_stubs_rpi4.c` on Pi
+4/5). Most are thin bridging shims over the array API above (every
+handshake message is small and bounded regardless of a board's own
+record ceiling); `tls_hash_transcript_heap` and `tls_encrypt_record_
+heap`/`tls_decrypt_record_heap` are genuinely new, unbounded-length
+logic built directly on the vendored packages' own streaming
+primitives:
+
+```
+fn tls_copy_heap(dst: mut ref i64, dst_off: i64, src: mut ref i64, src_off: i64, n: i64) -> i64
+fn tls_put_u8_heap/u16_heap/u24_heap(buf: mut ref i64, off: i64, v) -> i64
+fn tls_x25519_basepoint_heap(out: mut ref i64) -> i64
+fn tls_bytes_equal_heap(a: mut ref i64, b: mut ref i64, n: i64) -> i64
+
+fn tls_build_client_hello_heap(client_random: mut ref i64, client_pub: mut ref i64, out: mut ref i64) -> i64
+fn tls_build_server_hello_heap(server_random: mut ref i64, server_pub: mut ref i64, out: mut ref i64) -> i64
+fn tls_build_encrypted_extensions_heap(out: mut ref i64) -> i64
+fn tls_build_certificate_heap(raw_pubkey: mut ref i64, out: mut ref i64) -> i64
+fn tls_build_certificate_verify_heap(sig: mut ref i64, out: mut ref i64) -> i64
+fn tls_build_finished_heap(verify_data: mut ref i64, out: mut ref i64) -> i64
+fn tls_certverify_signed_content_heap(transcript_hash: mut ref i64, out: mut ref i64) -> i64
+
+fn tls_hash_transcript_heap(transcript: mut ref i64, transcript_len: i64) -> [u8; 32]
+fn tls_derive_secret_heap(secret: mut ref i64, label: Str, transcript: mut ref i64, transcript_len: i64) -> [u8; 32]
+fn tls_finished_verify_data_heap(traffic_secret: mut ref i64, transcript: mut ref i64, transcript_len: i64) -> [u8; 32]
+
+fn tls_encrypt_record_heap(key: mut ref i64, static_iv: mut ref i64, seq: u32, content: mut ref i64, content_len: i64, content_type: u32, out_record: mut ref i64) -> i64
+fn tls_decrypt_record_heap(key: mut ref i64, static_iv: mut ref i64, seq: u32, rec_data: mut ref i64, record_len: i64, expected_content_type: u32, out_content: mut ref i64) -> i64
+```
+
+`tls_hmac_sha256`/`tls_hkdf_extract`/`tls_hkdf_expand`/`tls_hkdf_
+expand_label`/`tls_derive_traffic_keys`/`tls_record_nonce`/`tls_
+basepoint32`/`tls_bytes_equal32` are reused as-is from the array API
+above for the heap-native functions too -- HMAC/HKDF/key-schedule
+operations always work on small, bounded 12-32-byte values (keys,
+IVs, digests) regardless of a board's own overall record-size ceiling.
+
 ## Verification
 
 `tls13_self_test()` runs a full client+server handshake (ClientHello
@@ -93,3 +141,18 @@ pre-existing, unrelated vani-compiler C-backend bug in the vendored
 struct fields (confirmed via `crypto_hash`'s own standalone test), not
 something introduced by this package. See
 `vani-compiler/docs/DHRUVAOS_ERGONOMICS_TODO.md` gap #5.
+
+The heap-pointer API has no standalone `test/host_test.vani` coverage
+of its own: `buf_read_byte`/`buf_write_byte` are `extern "C"` with no
+implementation in this package (a real consumer supplies them), so
+neither the LLVM JIT (`vanic run`, default) nor the C backend (blocked
+by gap #5 above regardless) can link a self-contained test. Verified
+instead via a standalone host probe (LLVM IR emission → `llc` → `cc`
+→ native execution, bypassing both blockers) cross-checking every
+`_heap` function against its array-API counterpart for identical
+inputs, plus a 1200-byte record round trip and tamper-rejection check
+beyond the array API's own 512-byte reach -- not committed to this
+repo (host-specific scratch, not portable), but reproducible the same
+way. Real, permanent verification is DhruvaOS's own Pi 1 kernel
+consuming this API directly, exercised by its live `tlsecho`/
+`httpecho`/`mqttecho` traffic under `test/phase4_milestone.py`.
