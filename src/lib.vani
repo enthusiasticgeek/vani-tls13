@@ -273,8 +273,17 @@ fn tls_hmac_sha256(key: ref [u8; 32], msg: ref [u8; 256], msg_len: i64) -> [u8; 
     msg_scratch[64 + i] = msg[i];
     i = i + 1;
   }
-  let inner_hash: [u8; 32] = [0 as u8; 32];
-  let _ = sha256_hash(mut ref msg_scratch, 64 + msg_len, mut ref inner_hash);
+  // sha256_hash (the one-shot convenience wrapper) is deliberately
+  // NOT used here -- it lives only in crypto_hash's lib.vani, not
+  // core.vani, and Pi 1 vendors core.vani (its own board-side code
+  // already defines several names lib.vani's self-tests would
+  // collide with). Built directly on the streaming API instead
+  // (init/update/finalize), present in both -- both inputs here are
+  // always well under one 256-byte chunk, so a single sha256_update
+  // call is a genuine one-shot hash, not a real streaming loop.
+  let inner_ctx0: Sha256Ctx = sha256_init();
+  let inner_ctx1: Sha256Ctx = sha256_update(ref inner_ctx0, mut ref msg_scratch, 64 + msg_len);
+  let inner_hash: [u8; 32] = sha256_finalize(ref inner_ctx1);
 
   let msg_scratch2: [u8; 256] = [0 as u8; 256];
   i = 0;
@@ -287,8 +296,9 @@ fn tls_hmac_sha256(key: ref [u8; 32], msg: ref [u8; 256], msg_len: i64) -> [u8; 
     msg_scratch2[64 + i] = inner_hash[i];
     i = i + 1;
   }
-  let out: [u8; 32] = [0 as u8; 32];
-  let _ = sha256_hash(mut ref msg_scratch2, 96, mut ref out);
+  let outer_ctx0: Sha256Ctx = sha256_init();
+  let outer_ctx1: Sha256Ctx = sha256_update(ref outer_ctx0, mut ref msg_scratch2, 96);
+  let out: [u8; 32] = sha256_finalize(ref outer_ctx1);
   return out;
 }
 
